@@ -1,5 +1,6 @@
+use crate::auth::{rand_alphanumeric, DefaultNonceGenerator, SaslAuthentication};
 use crate::errors::{ClientIdentifier, Error};
-use crate::pool::BanReason;
+use crate::pool::{get_all_pools_shared, BanReason, PoolIdentifier};
 /// Handle clients by pretending to be a PostgreSQL server.
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, trace, warn};
@@ -13,9 +14,10 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc::Sender;
 
 use crate::admin::{generate_server_parameters_for_admin, handle_admin};
+use crate::auth::AuthMethod;
 use crate::auth_passthrough::refetch_auth_hash;
 use crate::config::{
-    get_config, get_idle_client_in_transaction_timeout, Address, AuthType, PoolMode,
+    get_config_shared, get_idle_client_in_transaction_timeout, Address, AuthType, PoolMode,
 };
 use crate::constants::*;
 use crate::messages::*;
@@ -417,8 +419,8 @@ pub async fn startup_tls(
 
 impl<S, T> Client<S, T>
 where
-    S: tokio::io::AsyncRead + std::marker::Unpin,
-    T: tokio::io::AsyncWrite + std::marker::Unpin,
+    S: tokio::io::AsyncRead + std::marker::Unpin + Send,
+    T: tokio::io::AsyncWrite + std::marker::Unpin + Send,
 {
     pub fn is_admin(&self) -> bool {
         self.admin
@@ -483,58 +485,59 @@ where
         let process_id: i32 = rand::random();
         let secret_key: i32 = rand::random();
 
-        let mut prepared_statements_enabled = false;
+        let config = get_config_shared();
+        let pools = get_all_pools_shared();
+        // The pool we're connecting to (if any)
+        let pool = pools.get(&PoolIdentifier::new(pool_name, username));
+        let auth_method = pool
+            .and_then(|pool| pool.settings.auth_method.clone())
+            .unwrap_or(config.general.auth_method.clone());
 
-        // Authenticate admin user.
-        let (transaction_mode, mut server_parameters) = if admin {
-            let config = get_config();
-            // TODO: Add SASL support.
-            // Perform MD5 authentication.
-            match config.general.admin_auth_type {
-                AuthType::Trust => (),
-                AuthType::MD5 => {
-                    let salt = md5_challenge(&mut write).await?;
-
-                    let code = match read.read_u8().await {
-                        Ok(p) => p,
-                        Err(_) => {
-                            return Err(Error::ClientSocketError(
-                                "password code".into(),
-                                client_identifier,
-                            ))
-                        }
-                    };
-
-                    // PasswordMessage
-                    if code as char != 'p' {
-                        return Err(Error::ProtocolSyncError(format!(
-                            "Expected p, got {}",
-                            code as char
-                        )));
+        match auth_method {
+            AuthMethod::Md5 => {
+                let salt = md5_challenge(&mut write).await?;
+                let code = match read.read_u8().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return Err(Error::ClientSocketError(
+                            "password code".into(),
+                            client_identifier,
+                        ))
                     }
+                };
 
-                    let len = match read.read_i32().await {
-                        Ok(len) => len,
-                        Err(_) => {
-                            return Err(Error::ClientSocketError(
-                                "password message length".into(),
-                                client_identifier,
-                            ))
-                        }
-                    };
+                // PasswordMessage
+                if code as char != 'p' {
+                    return Err(Error::ProtocolSyncError(format!(
+                        "Expected p, got {}",
+                        code as char
+                    )));
+                }
 
-                    let mut password_response = vec![0u8; (len - 4) as usize];
+                let len = match read.read_i32().await {
+                    Ok(len) => len,
+                    Err(_) => {
+                        return Err(Error::ClientSocketError(
+                            "password message length".into(),
+                            client_identifier,
+                        ))
+                    }
+                };
 
-                    match read.read_exact(&mut password_response).await {
-                        Ok(_) => (),
-                        Err(_) => {
-                            return Err(Error::ClientSocketError(
-                                "password message".into(),
-                                client_identifier,
-                            ))
-                        }
-                    };
+                let mut password_response = vec![0u8; (len - 4) as usize];
 
+                match read.read_exact(&mut password_response).await {
+                    Ok(_) => (),
+                    Err(_) => {
+                        return Err(Error::ClientSocketError(
+                            "password message".into(),
+                            client_identifier,
+                        ))
+                    }
+                };
+
+                // Authenticate admin user.
+                if admin {
                     // Compare server and client hashes.
                     let password_hash = md5_hash_password(
                         &config.general.admin_username,
@@ -552,84 +555,34 @@ where
                         return Err(error);
                     }
                 }
-            }
-            (false, generate_server_parameters_for_admin())
-        }
-        // Authenticate normal user.
-        else {
-            let pool = match get_or_create_pool(pool_name, username).await {
-                Some(pool) => pool,
-                None => {
-                    error_response(
-                        &mut write,
-                        &format!(
-                            "No pool configured for database: {:?}, user: {:?}",
-                            pool_name, username
-                        ),
-                    )
-                    .await?;
+                // Authenticate normal user.
+                else {
+                    let pool = match pool {
+                        Some(pool) => pool,
+                        None => {
+                            error_response(
+                                &mut write,
+                                &format!(
+                                    "No pool configured for database: {:?}, user: {:?}",
+                                    pool_name, username
+                                ),
+                            )
+                            .await?;
 
-                    return Err(Error::ClientGeneralError(
-                        "Invalid pool name".into(),
-                        client_identifier,
-                    ));
-                }
-            };
-
-            // Obtain the hash to compare, we give preference to that written in cleartext in config
-            // if there is nothing set in cleartext and auth passthrough (auth_query) is configured, we use the hash obtained
-            // when the pool was created. If there is no hash there, we try to fetch it one more time.
-            match pool.settings.user.auth_type {
-                AuthType::Trust => (),
-                AuthType::MD5 => {
-                    // Perform MD5 authentication.
-                    // TODO: Add SASL support.
-                    let salt = md5_challenge(&mut write).await?;
-
-                    let code = match read.read_u8().await {
-                        Ok(p) => p,
-                        Err(_) => {
-                            return Err(Error::ClientSocketError(
-                                "password code".into(),
+                            return Err(Error::ClientGeneralError(
+                                "Invalid pool name".into(),
                                 client_identifier,
-                            ))
+                            ));
                         }
                     };
 
-                    // PasswordMessage
-                    if code as char != 'p' {
-                        return Err(Error::ProtocolSyncError(format!(
-                            "Expected p, got {}",
-                            code as char
-                        )));
-                    }
-
-                    let len = match read.read_i32().await {
-                        Ok(len) => len,
-                        Err(_) => {
-                            return Err(Error::ClientSocketError(
-                                "password message length".into(),
-                                client_identifier,
-                            ))
-                        }
-                    };
-
-                    let mut password_response = vec![0u8; (len - 4) as usize];
-
-                    match read.read_exact(&mut password_response).await {
-                        Ok(_) => (),
-                        Err(_) => {
-                            return Err(Error::ClientSocketError(
-                                "password message".into(),
-                                client_identifier,
-                            ))
-                        }
-                    };
-
+                    // Obtain the hash to compare, we give preference to that written in cleartext in config
+                    // if there is nothing set in cleartext and auth passthrough (auth_query) is configured, we use the hash obtained
+                    // when the pool was created. If there is no hash there, we try to fetch it one more time.
                     let password_hash = if let Some(password) = &pool.settings.user.password {
                         Some(md5_hash_password(username, password, &salt))
                     } else {
-                        if !get_config().is_auth_query_configured() {
+                        if !config.is_auth_query_configured() {
                             wrong_password(&mut write, username).await?;
                             return Err(Error::ClientAuthImpossible(username.into()));
                         }
@@ -639,12 +592,12 @@ where
                         if hash.is_none() {
                             warn!(
                                 "Query auth configured \
-                                  but no hash password found \
-                                  for pool {}. Will try to refetch it.",
+                          but no hash password found \
+                          for pool {}. Will try to refetch it.",
                                 pool_name
                             );
 
-                            match refetch_auth_hash(&pool).await {
+                            match refetch_auth_hash(pool).await {
                                 Ok(fetched_hash) => {
                                     warn!(
                                         "Password for {}, obtained. Updating.",
@@ -684,7 +637,7 @@ where
                             client_identifier
                         );
 
-                        let fetched_hash = match refetch_auth_hash(&pool).await {
+                        let fetched_hash = match refetch_auth_hash(pool).await {
                             Ok(fetched_hash) => fetched_hash,
                             Err(err) => {
                                 wrong_password(&mut write, username).await?;
@@ -716,6 +669,51 @@ where
                     }
                 }
             }
+            AuthMethod::ScramSha256 => {
+                let password = if admin {
+                    &config.general.admin_password
+                } else if let Some(pool) = pool {
+                    match pool.settings.user.password.as_ref() {
+                        Some(password) => password,
+                        None => {
+                            wrong_password(&mut write, username).await?;
+                            return Err(Error::ClientAuthImpossible(username.into()));
+                        }
+                    }
+                } else {
+                    error_response(
+                        &mut write,
+                        &format!(
+                            "No pool configured for database: {:?}, user: {:?}",
+                            pool_name, username
+                        ),
+                    )
+                    .await?;
+
+                    return Err(Error::ClientGeneralError(
+                        "Invalid pool name".into(),
+                        client_identifier,
+                    ));
+                };
+
+                let mut authentication =
+                    SaslAuthentication::new(&mut read, &mut write, &client_identifier);
+
+                let salt = rand_alphanumeric(4);
+                let iteration_count = 4096;
+
+                authentication
+                    .authenticate::<DefaultNonceGenerator>(
+                        password.as_str(),
+                        salt.as_bytes(),
+                        iteration_count,
+                    )
+                    .await?;
+            }
+        }
+
+        let mut prepared_statements_enabled = false;
+        let (transaction_mode, mut server_parameters) = if let Some(pool) = pool {
             let transaction_mode = pool.settings.pool_mode == PoolMode::Transaction;
             prepared_statements_enabled =
                 transaction_mode && pool.prepared_statement_cache.is_some();
@@ -740,12 +738,15 @@ where
             }
 
             (transaction_mode, pool.server_parameters())
+        } else {
+            // We're in admin mode
+            (false, generate_server_parameters_for_admin())
         };
 
         // Update the parameters to merge what the application sent and what's originally on the server
         server_parameters.set_from_hashmap(&parameters, false);
 
-        debug!("Password authentication successful");
+        debug!("{} authentication successful", auth_method);
 
         auth_ok(&mut write).await?;
         write_all(&mut write, (&server_parameters).into()).await?;
