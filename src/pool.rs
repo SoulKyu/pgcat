@@ -1244,7 +1244,7 @@ pub async fn get_or_create_pool(db: &str, user: &str) -> Option<ConnectionPool> 
 
             pool = match create_pool_for_proxy(db, user).await {
                 Ok(pool) => Option::from(pool.unwrap()),
-                Err(err) => None,
+                Err(_) => None,
             };
 
             info!("Created a new pool {:?}", pool);
@@ -1262,7 +1262,7 @@ pub fn get_all_pools() -> HashMap<PoolIdentifier, ConnectionPool> {
 async fn create_pool_for_proxy(
     db: &str,
     psql_user: &str,
-) -> Result<(Option<ConnectionPool>), Error> {
+) -> Result<Option<ConnectionPool>, Error> {
     let config = get_config();
     let client_server_map: ClientServerMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1327,7 +1327,7 @@ async fn create_pool_for_proxy(
 
             let address = Address {
                 id: address_id,
-                database: psql_user.to_string(),
+                database: shard.database.clone(),
                 host: server.host.clone(),
                 port: server.port,
                 role: server.role,
