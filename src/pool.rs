@@ -1263,33 +1263,44 @@ async fn create_pool_for_proxy(
     db: &str,
     psql_user: &str,
 ) -> Result<Option<ConnectionPool>, Error> {
+    info!("Starting pool creation for database '{}' and user '{}'", db, psql_user);
+    
     let config = get_config();
     let client_server_map: ClientServerMap = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut new_pools = HashMap::new();
-    let mut address_id: usize = 0;
+    let pool_config_opt = match config.pools.get_key_value(db) {
+        Some((name, config)) => (name, config),
+        None => {
+            error!("No pool configuration found for database '{}'", db);
+            return Ok(None);
+        }
+    };
 
-    let pool_config_opt = config.pools.get_key_value(db);
+    let pool_name: &str = pool_config_opt.0;
+    let pool_config = pool_config_opt.1;
 
-    let pool_name: &str = pool_config_opt.unwrap().0;
-    let pool_config = pool_config_opt.unwrap().1;
+    info!("Using pool configuration for '{}' with proxy mode", pool_name);
 
-    info!("Created a new pool {:?}", pool_config);
-
-    let mut user: User = pool_config.users.get("0").unwrap().clone();
+    let mut user: User = match pool_config.users.get("0") {
+        Some(u) => u.clone(),
+        None => {
+            warn!("No user '0' found in pool config, using defaults");
+            User::default()
+        }
+    };
     user.username = psql_user.to_string();
 
     let mut shards = Vec::new();
     let mut addresses = Vec::new();
     let mut banlist = Vec::new();
-    let mut shard_ids = pool_config
+    let mut shard_ids: Vec<String> = pool_config
         .shards
         .clone()
         .into_keys()
-        .collect::<Vec<String>>();
+        .collect();
 
-    // Sort by shard number to ensure consistency.
-    shard_ids.sort_by_key(|k| k.parse::<i64>().unwrap());
+    // Sort by shard number to ensure consistency
+    shard_ids.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
     let pool_auth_hash: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
     for shard_idx in &shard_ids {
@@ -1297,34 +1308,10 @@ async fn create_pool_for_proxy(
         let mut pools = Vec::new();
         let mut servers = Vec::new();
         let mut replica_number = 0;
+        let mut address_id = 0;
 
-        // Load Mirror settings
+        // Server configuration
         for (address_index, server) in shard.servers.iter().enumerate() {
-            let mut mirror_addresses = vec![];
-            if let Some(mirror_settings_vec) = &shard.mirrors {
-                for (mirror_idx, mirror_settings) in mirror_settings_vec.iter().enumerate() {
-                    if mirror_settings.mirroring_target_index != address_index {
-                        continue;
-                    }
-                    mirror_addresses.push(Address {
-                        id: address_id,
-                        database: db.to_string(),
-                        host: mirror_settings.host.clone(),
-                        port: mirror_settings.port,
-                        role: server.role,
-                        address_index: mirror_idx,
-                        replica_number,
-                        shard: shard_idx.parse::<usize>().unwrap(),
-                        username: user.username.clone(),
-                        pool_name: pool_name.to_string(),
-                        mirrors: vec![],
-                        stats: Arc::new(AddressStats::default()),
-                        error_count: Arc::new(AtomicU64::new(0)),
-                    });
-                    address_id += 1;
-                }
-            }
-
             let address = Address {
                 id: address_id,
                 database: shard.database.clone(),
@@ -1336,7 +1323,7 @@ async fn create_pool_for_proxy(
                 shard: shard_idx.parse::<usize>().unwrap(),
                 username: user.username.clone(),
                 pool_name: pool_name.to_string(),
-                mirrors: mirror_addresses,
+                mirrors: vec![],
                 stats: Arc::new(AddressStats::default()),
                 error_count: Arc::new(AtomicU64::new(0)),
             };
@@ -1347,93 +1334,58 @@ async fn create_pool_for_proxy(
                 replica_number += 1;
             }
 
-            // We assume every server in the pool share user/passwords
-            let auth_passthrough = AuthPassthrough::from_pool_config(pool_config);
-
-            if let Some(apt) = &auth_passthrough {
+            // Handle auth passthrough
+            if let Some(apt) = AuthPassthrough::from_pool_config(pool_config) {
                 match apt.fetch_hash(&address).await {
-                    Ok(ok) => {
-                        if let Some(ref pool_auth_hash_value) = *(pool_auth_hash.read()) {
-                            if ok != *pool_auth_hash_value {
-                                warn!(
-                                    "Hash is not the same across shards \
-                                    of the same pool, client auth will \
-                                    be done using last obtained hash. \
-                                    Server: {}:{}, Database: {}",
-                                    server.host, server.port, shard.database,
-                                );
-                            }
-                        }
-
-                        debug!("Hash obtained for {:?}", address);
-
-                        {
-                            let mut pool_auth_hash = pool_auth_hash.write();
-                            *pool_auth_hash = Some(ok.clone());
-                        }
+                    Ok(hash) => {
+                        info!("Successfully obtained auth hash for user '{}'", user.username);
+                        let mut pool_auth_hash = pool_auth_hash.write();
+                        *pool_auth_hash = Some(hash);
                     }
-                    Err(err) => warn!(
-                        "Could not obtain password hashes \
-                                        using auth_query config, ignoring. \
-                                        Error: {:?}",
-                        err,
-                    ),
+                    Err(err) => {
+                        warn!(
+                            "Failed to obtain password hash for user '{}': {:?}",
+                            user.username, err
+                        );
+                    }
                 }
             }
 
             let manager = ServerPool::new(
                 address.clone(),
                 user.clone(),
-                psql_user.clone(),
+                &shard.database,
                 client_server_map.clone(),
                 pool_auth_hash.clone(),
-                match pool_config.plugins {
-                    Some(ref plugins) => Some(plugins.clone()),
-                    None => config.plugins.clone(),
-                },
+                pool_config.plugins.clone().or(config.plugins.clone()),
                 pool_config.cleanup_server_connections,
                 pool_config.log_client_parameter_status_changes,
                 pool_config.prepared_statements_cache_size,
             );
 
-            let connect_timeout = match user.connect_timeout {
-                Some(connect_timeout) => connect_timeout,
-                None => match pool_config.connect_timeout {
-                    Some(connect_timeout) => connect_timeout,
-                    None => config.general.connect_timeout,
-                },
-            };
+            // Pool configuration
+            let connect_timeout = user.connect_timeout
+                .or(pool_config.connect_timeout)
+                .unwrap_or(config.general.connect_timeout);
 
-            let idle_timeout = match user.idle_timeout {
-                Some(idle_timeout) => idle_timeout,
-                None => match pool_config.idle_timeout {
-                    Some(idle_timeout) => idle_timeout,
-                    None => config.general.idle_timeout,
-                },
-            };
+            let idle_timeout = user.idle_timeout
+                .or(pool_config.idle_timeout)
+                .unwrap_or(config.general.idle_timeout);
 
-            let server_lifetime = match user.server_lifetime {
-                Some(server_lifetime) => server_lifetime,
-                None => match pool_config.server_lifetime {
-                    Some(server_lifetime) => server_lifetime,
-                    None => config.general.server_lifetime,
-                },
-            };
+            let server_lifetime = user.server_lifetime
+                .or(pool_config.server_lifetime)
+                .unwrap_or(config.general.server_lifetime);
 
             let reaper_rate = *[idle_timeout, server_lifetime, POOL_REAPER_RATE]
                 .iter()
                 .min()
                 .unwrap();
 
-            let queue_strategy = match config.general.server_round_robin {
-                true => QueueStrategy::Fifo,
-                false => QueueStrategy::Lifo,
+            let queue_strategy = if config.general.server_round_robin {
+                QueueStrategy::Fifo
+            } else {
+                QueueStrategy::Lifo
             };
-
-            debug!(
-                "[pool: {}][user: {}] Pool reaper rate: {}ms",
-                pool_name, user.username, reaper_rate
-            );
 
             let pool = Pool::builder()
                 .max_size(user.pool_size)
@@ -1446,7 +1398,13 @@ async fn create_pool_for_proxy(
                 .test_on_check_out(false);
 
             let pool = if config.general.validate_config {
-                pool.build(manager).await?
+                match pool.build(manager).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Failed to build pool for '{}': {:?}", pool_name, e);
+                        return Err(e);
+                    }
+                }
             } else {
                 pool.build_unchecked(manager)
             };
@@ -1459,29 +1417,25 @@ async fn create_pool_for_proxy(
         addresses.push(servers);
         banlist.push(HashMap::new());
     }
-    assert_eq!(shards.len(), addresses.len());
-    if let Some(ref _auth_hash) = *(pool_auth_hash.clone().read()) {
-        info!(
-            "Auth hash obtained from query_auth for pool {{ name: {}, user: {} }}",
-            pool_name, user.username
-        );
-    }
-    let new_pool_hash_value = pool_config.hash_value();
 
+    if shards.is_empty() {
+        error!("No shards configured for pool '{}'", pool_name);
+        return Ok(None);
+    }
+
+    assert_eq!(shards.len(), addresses.len());
+
+    // Create the connection pool
     let pool = ConnectionPool {
         databases: Arc::new(shards),
         addresses: Arc::new(addresses),
         banlist: Arc::new(RwLock::new(banlist)),
-        config_hash: new_pool_hash_value,
+        config_hash: pool_config.hash_value(),
         original_server_parameters: Arc::new(RwLock::new(ServerParameters::new())),
-        auth_hash: pool_auth_hash,
+        auth_hash: pool_auth_hash.clone(),
         settings: Arc::new(PoolSettings {
-            pool_mode: match user.pool_mode {
-                Some(pool_mode) => pool_mode,
-                None => pool_config.pool_mode,
-            },
+            pool_mode: user.pool_mode.unwrap_or(pool_config.pool_mode),
             load_balancing_mode: pool_config.load_balancing_mode,
-            // shards: pool_config.shards.clone(),
             shards: shard_ids.len(),
             user: user.clone(),
             db: pool_name.to_string(),
@@ -1489,7 +1443,7 @@ async fn create_pool_for_proxy(
                 "any" => None,
                 "replica" => Some(Role::Replica),
                 "primary" => Some(Role::Primary),
-                _ => unreachable!(),
+                _ => None,
             },
             query_parser_enabled: pool_config.query_parser_enabled,
             query_parser_max_length: pool_config.query_parser_max_length,
@@ -1500,49 +1454,42 @@ async fn create_pool_for_proxy(
             healthcheck_delay: config.general.healthcheck_delay,
             healthcheck_timeout: config.general.healthcheck_timeout,
             ban_time: config.general.ban_time,
-            sharding_key_regex: pool_config
-                .sharding_key_regex
-                .clone()
+            sharding_key_regex: pool_config.sharding_key_regex.clone()
                 .map(|regex| Regex::new(regex.as_str()).unwrap()),
-            shard_id_regex: pool_config
-                .shard_id_regex
-                .clone()
+            shard_id_regex: pool_config.shard_id_regex.clone()
                 .map(|regex| Regex::new(regex.as_str()).unwrap()),
             regex_search_limit: pool_config.regex_search_limit.unwrap_or(1000),
             default_shard: pool_config.default_shard,
             auth_query: pool_config.auth_query.clone(),
             auth_query_user: pool_config.auth_query_user.clone(),
             auth_query_password: pool_config.auth_query_password.clone(),
-            proxy: pool_config.proxy.clone(),
-            plugins: match pool_config.plugins {
-                Some(ref plugins) => Some(plugins.clone()),
-                None => config.plugins.clone(),
-            },
+            proxy: pool_config.proxy,
+            plugins: pool_config.plugins.clone(),
         }),
         validated: Arc::new(AtomicBool::new(false)),
         paused: Arc::new(AtomicBool::new(false)),
         paused_waiter: Arc::new(Notify::new()),
-        prepared_statement_cache: match pool_config.prepared_statements_cache_size {
-            0 => None,
-            _ => Some(Arc::new(Mutex::new(PreparedStatementCache::new(
+        prepared_statement_cache: if pool_config.prepared_statements_cache_size > 0 {
+            Some(Arc::new(Mutex::new(PreparedStatementCache::new(
                 pool_config.prepared_statements_cache_size,
-            )))),
+            ))))
+        } else {
+            None
         },
     };
-    // Connect to the servers to make sure pool configuration is valid
-    // before setting it globally.
-    // Do this async and somewhere else, we don't have to wait here.
+
+    // Validate the pool if required
     if config.general.validate_config {
-        let validate_pool = pool.clone();
-        tokio::task::spawn(async move {
-            let _ = validate_pool.validate().await;
-        });
+        if let Err(e) = pool.validate().await {
+            error!("Pool validation failed for '{}': {:?}", pool_name, e);
+            return Err(e);
+        }
     }
 
-    // There is one pool per database/user pair.
+    let mut new_pools = HashMap::new();
     new_pools.insert(PoolIdentifier::new(pool_name, &user.username), pool.clone());
+    POOLS.store(Arc::new(new_pools));
 
-    POOLS.store(Arc::new(new_pools.clone()));
-
-    Ok(Option::Some::<ConnectionPool>(pool))
+    info!("Successfully created pool for database '{}' and user '{}'", db, psql_user);
+    Ok(Some(pool))
 }
