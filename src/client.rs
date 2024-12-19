@@ -557,7 +557,7 @@ where
                 }
                 // Authenticate normal user.
                 else {
-                    let pool = match pool {
+                    let pool = match get_or_create_pool(pool_name, username).await {
                         Some(pool) => pool,
                         None => {
                             error_response(

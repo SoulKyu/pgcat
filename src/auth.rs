@@ -64,6 +64,11 @@ pub struct SaslAuthentication<'a, S, T> {
     client_identifier: &'a ClientIdentifier,
 }
 
+pub struct ClientFirstMessageBare {
+    nonce: Bytes,
+    raw: Bytes,
+}
+
 impl<'a, S, T> SaslAuthentication<'a, S, T> {
     pub fn new(read: &'a mut S, write: &'a mut T, client_identifier: &'a ClientIdentifier) -> Self {
         Self {
@@ -72,11 +77,6 @@ impl<'a, S, T> SaslAuthentication<'a, S, T> {
             client_identifier,
         }
     }
-}
-
-pub struct ClientFirstMessageBare {
-    nonce: Bytes,
-    raw: Bytes,
 }
 
 impl<'a, S, T> SaslAuthentication<'a, S, T>
@@ -90,10 +90,9 @@ where
         salt: &[u8],
         iteration_count: u32,
     ) -> Result<(), Error> {
-        // Channel binding is not currently supported, so we only advertise the non-PLUS
-        // variant
         let supported_auth_mechanisms = vec![SaslMechanism::ScramSha256];
         authentication_sasl(self.write, &supported_auth_mechanisms).await?;
+        
         let client_first_message_bare = self
             .recv_client_sasl_initial_response(&supported_auth_mechanisms)
             .await?;
@@ -143,15 +142,13 @@ where
                 }
             };
 
-        // Verify nonce
         let saved_nonce = format!("{}{}", c_nonce, s_nonce);
         match client_final_message_without_proof.split_once(',') {
             Some((_, nonce)) if nonce.starts_with("r=") && saved_nonce.as_str() == &nonce[2..] => {}
             _ => return Err(Error::AuthError("failed to validate nonce".to_string())),
         }
 
-        let client_proof = match base64::engine::general_purpose::STANDARD.decode(client_proof_b64)
-        {
+        let client_proof = match base64::engine::general_purpose::STANDARD.decode(client_proof_b64) {
             Ok(proof) => proof,
             Err(_) => return Err(Error::ProtocolSyncError("invalid client proof".to_string())),
         };
@@ -168,13 +165,12 @@ where
         };
 
         hmac.update(b"Client Key");
-
         let client_key = hmac.finalize().into_bytes();
 
         let mut hash = Sha256::default();
         hash.update(client_key.as_slice());
-
         let stored_key = hash.finalize_fixed();
+
         let auth_message = format!(
             "{},{},{}",
             String::from_utf8_lossy(client_first_message_bare.raw.as_ref()),
@@ -188,7 +184,6 @@ where
         };
 
         hmac.update(auth_message.as_bytes());
-
         let client_signature = hmac.finalize().into_bytes();
 
         if client_signature.len() != client_proof.len() {
@@ -244,8 +239,6 @@ where
             }
         };
 
-        // Rest of message. We buffer the entire message here to avoid
-        // making multiple syscalls
         let mut rest = vec![0u8; (len - 4) as usize];
 
         match self.read.read_exact(&mut rest).await {
@@ -262,8 +255,6 @@ where
         let mut cursor = std::io::Cursor::new(&rest[..]);
 
         loop {
-            // This incurs no overhead from the async call, as data inside
-            // the cursor will be ready immediately
             match cursor.read_u8().await {
                 Ok(0) => break,
                 Ok(b) => mechanism.push(b as char),
@@ -276,8 +267,6 @@ where
             }
         }
 
-        // Ensure that the requested auth mechanism the client requested is
-        // supported
         if !supported_auth_mechanisms
             .iter()
             .map(|m| m.to_string())
@@ -316,41 +305,7 @@ where
             }
         };
 
-        let client_first_message = match std::str::from_utf8(&client_first_message[..]) {
-            Ok(s) => s,
-            Err(_) => {
-                return Err(Error::ProtocolSyncError(
-                    "invalid client-first-message".to_string(),
-                ))
-            }
-        };
-
-        let parts = client_first_message
-            .split(|c| c == ',')
-            .collect::<Vec<&str>>();
-
-        if parts.len() != 4 {
-            return Err(Error::ProtocolSyncError(
-                "extensions are not supported".to_string(),
-            ));
-        }
-
-        match parts[0] {
-            "n" | "y" => (),
-            "p" => {
-                return Err(Error::ProtocolSyncError(
-                    "channel binding is not supported".to_string(),
-                ))
-            }
-            _ => {
-                return Err(Error::AuthError("Invalid client-first-message".into()));
-            }
-        }
-
-        let client_first_message_bare =
-            Self::parse_client_first_message_bare(parts[2..].join(",").as_bytes())?;
-
-        Ok(client_first_message_bare)
+        Self::parse_client_first_message_bare(&client_first_message[..])
     }
 
     fn parse_client_first_message_bare(
@@ -362,8 +317,6 @@ where
             i += 1;
         }
 
-        // We check the format of the message, but don't actually care
-        // about storing the username
         match std::str::from_utf8(&client_first_message_bare[start..i]) {
             Ok(s) => {
                 if s.starts_with("m=") {
@@ -401,13 +354,9 @@ where
         let raw = Bytes::copy_from_slice(client_first_message_bare);
         let nonce = raw.slice((start + 2)..);
 
-        // We don't care about extensions at this time, so we stop after we
-        // gather the nonce
-
         Ok(ClientFirstMessageBare { nonce, raw })
     }
 
-    /// Server generated `AuthenticationSASLContinue` message
     async fn send_auth_sasl_continue(
         &mut self,
         s_nonce: &[u8],
@@ -433,8 +382,6 @@ where
         Ok(server_first_message)
     }
 
-    /// Returns the SASL mechanism specific message data associated with the
-    /// client's final message
     async fn recv_client_final_message(&mut self) -> Result<Bytes, Error> {
         let client_identifier = self.client_identifier.clone();
         match self.read.read_u8().await {
@@ -523,7 +470,6 @@ mod tests {
 
     fn build_sasl_final_response(client_final_message: &str) -> BytesMut {
         let mut bytes = BytesMut::new();
-        // let client_final_message = CString::new(client_final_message).unwrap();
 
         bytes.put_u8(b'p');
         bytes.put_i32((4 + client_final_message.len()) as i32);
@@ -540,12 +486,9 @@ mod tests {
         client_first_message: &str,
     ) -> (ReadResponseHandle, WriteResponseHandle) {
         let bytes = build_sasl_initial_response(sasl_mechanism, client_first_message);
-
         split(Cursor::new(bytes.to_vec()))
     }
 
-    /// The exchange found in this test is taken from the example SCRAM authentication
-    /// exchange found in [RFC 7677](https://datatracker.ietf.org/doc/html/rfc7677#section-3)
     #[tokio::test]
     async fn test_scram_sha_256_auth_success() {
         let mut c_bytes = BytesMut::new();
@@ -569,7 +512,6 @@ mod tests {
         c_bytes.put_slice(sasl_final_response.as_ref());
 
         let mut read = Cursor::new(c_bytes.to_vec());
-        // We don't care about validating the server's response, so we provide this dummy container
         let mut write = Cursor::new(Vec::<u8>::new());
 
         let client_identifier = ClientIdentifier::new("test_app", "user", "pool");
